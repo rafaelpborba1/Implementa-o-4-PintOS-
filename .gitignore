@@ -1,0 +1,8 @@
+build/
+*.o
+*.d
+*.dsk
+src/utils/backtrace
+src/utils/squish-pty
+src/utils/squish-unix
+src/utils/setitimer-helper
