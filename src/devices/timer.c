@@ -24,11 +24,28 @@ static int64_t ticks;
    Initialized by timer_calibrate(). */
 static unsigned loops_per_tick;
 
+/* Uma thread dormindo em timer_sleep().  Vive na pilha da thread
+   que chamou timer_sleep(), o que e seguro porque a thread fica
+   bloqueada (e sua pilha continua valida) ate ser acordada. */
+struct sleeper
+  {
+    int64_t wake_tick;          /* Tick em que a thread deve acordar. */
+    struct semaphore sema;      /* Inicia em 0; bloqueia a thread. */
+    struct list_elem elem;      /* Elemento de sleep_list. */
+  };
+
+/* Threads dormindo, ordenadas por wake_tick (menor primeiro).
+   Compartilhada entre threads do kernel e o timer_interrupt(),
+   entao so deve ser acessada com interrupcoes desativadas. */
+static struct list sleep_list;
+
 static intr_handler_func timer_interrupt;
 static bool too_many_loops (unsigned loops);
 static void busy_wait (int64_t loops);
 static void real_time_sleep (int64_t num, int32_t denom);
 static void real_time_delay (int64_t num, int32_t denom);
+static bool sleeper_less (const struct list_elem *a,
+                          const struct list_elem *b, void *aux UNUSED);
 
 /* Sets up the timer to interrupt TIMER_FREQ times per second,
    and registers the corresponding interrupt. */
@@ -37,6 +54,7 @@ timer_init (void)
 {
   pit_configure_channel (0, 2, TIMER_FREQ);
   intr_register_ext (0x20, timer_interrupt, "8254 Timer");
+  list_init (&sleep_list);
 }
 
 /* Calibrates loops_per_tick, used to implement brief delays. */
@@ -85,15 +103,39 @@ timer_elapsed (int64_t then)
 }
 
 /* Sleeps for approximately TICKS timer ticks.  Interrupts must
-   be turned on. */
+   be turned on.
+
+   Sem busy wait: a thread registra o tick em que deve acordar,
+   entra em sleep_list e bloqueia em um semaforo.  O
+   timer_interrupt() faz sema_up quando o tempo vence. */
 void
 timer_sleep (int64_t ticks) 
 {
-  int64_t start = timer_ticks ();
+  struct sleeper s;
+  enum intr_level old_level;
 
   ASSERT (intr_get_level () == INTR_ON);
-  while (timer_elapsed (start) < ticks) 
-    thread_yield ();
+
+  /* Nada a esperar para TICKS <= 0. */
+  if (ticks <= 0)
+    return;
+
+  /* Note: o parametro TICKS esconde a variavel global ticks,
+     por isso o tick atual vem de timer_ticks(). */
+  s.wake_tick = timer_ticks () + ticks;
+  sema_init (&s.sema, 0);
+
+  /* sleep_list e compartilhada com o timer_interrupt(), que nao
+     pode adquirir locks; por isso protegemos com interrupcoes
+     desativadas. */
+  old_level = intr_disable ();
+  list_insert_ordered (&sleep_list, &s.elem, sleeper_less, NULL);
+  intr_set_level (old_level);
+
+  /* Bloqueia ate o timer_interrupt() fazer sema_up.  Se o tick
+     vencer antes deste ponto, o valor do semaforo ja estara em 1
+     e sema_down retorna imediatamente. */
+  sema_down (&s.sema);
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -165,13 +207,37 @@ timer_print_stats (void)
 {
   printf ("Timer: %"PRId64" ticks\n", timer_ticks ());
 }
-
+
 /* Timer interrupt handler. */
 static void
 timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
   thread_tick ();
+
+  /* Acorda as threads cujo tempo venceu.  Como sleep_list esta
+     ordenada por wake_tick, basta olhar o inicio da lista e
+     parar no primeiro que ainda nao venceu.  Interrupcoes ja
+     estao desativadas dentro de um handler de interrupcao. */
+  while (!list_empty (&sleep_list))
+    {
+      struct sleeper *s = list_entry (list_front (&sleep_list),
+                                      struct sleeper, elem);
+      if (s->wake_tick > ticks)
+        break;
+      list_pop_front (&sleep_list);
+      sema_up (&s->sema);
+    }
+}
+
+/* Compara dois sleepers por wake_tick, para list_insert_ordered().
+   Retorna true se A deve acordar antes de B. */
+static bool
+sleeper_less (const struct list_elem *a, const struct list_elem *b,
+              void *aux UNUSED)
+{
+  return list_entry (a, struct sleeper, elem)->wake_tick
+         < list_entry (b, struct sleeper, elem)->wake_tick;
 }
 
 /* Returns true if LOOPS iterations waits for more than one timer
